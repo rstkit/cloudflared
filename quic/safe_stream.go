@@ -9,7 +9,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 // The error that is throw by the writer when there is `no network activity`.
@@ -17,13 +16,13 @@ var idleTimeoutError = quic.IdleTimeoutError{}
 
 type SafeStreamCloser struct {
 	lock         sync.Mutex
-	stream       quic.Stream
+	stream       *quic.Stream
 	writeTimeout time.Duration
 	log          *zerolog.Logger
 	closing      atomic.Bool
 }
 
-func NewSafeStreamCloser(stream quic.Stream, writeTimeout time.Duration, log *zerolog.Logger) *SafeStreamCloser {
+func NewSafeStreamCloser(stream *quic.Stream, writeTimeout time.Duration, log *zerolog.Logger) *SafeStreamCloser {
 	return &SafeStreamCloser{
 		stream:       stream,
 		writeTimeout: writeTimeout,
@@ -41,7 +40,7 @@ func (s *SafeStreamCloser) Write(p []byte) (n int, err error) {
 	if s.writeTimeout > 0 {
 		err = s.stream.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 		if err != nil {
-			log.Err(err).Msg("Error setting write deadline for QUIC stream")
+			s.log.Err(err).Msg("Error setting write deadline for QUIC stream")
 		}
 	}
 	nBytes, err := s.stream.Write(p)
@@ -97,6 +96,14 @@ func (s *SafeStreamCloser) CloseWrite() error {
 	// reading.
 	// We can still read from this stream.
 	return s.stream.Close()
+}
+
+// CloseRead cancels only the receive side of the QUIC stream. In particular,
+// this unblocks a goroutine waiting in Read without closing the send side that
+// cloudflared still needs to write the response.
+func (s *SafeStreamCloser) CloseRead() error {
+	s.stream.CancelRead(0)
+	return nil
 }
 
 func (s *SafeStreamCloser) SetDeadline(deadline time.Time) error {

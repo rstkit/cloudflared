@@ -1,9 +1,13 @@
 # use a builder image for building cloudflare
 ARG TARGET_GOOS
 ARG TARGET_GOARCH
-FROM golang:1.24.13 AS builder
+FROM golang:1.27.4 AS builder
+ARG TARGET_GOOS
+ARG TARGET_GOARCH
+ARG GOPROXY=https://athens.cfdata.org|https://proxy.golang.org|direct
 ENV GO111MODULE=on \
   CGO_ENABLED=0 \
+  GOPROXY=${GOPROXY} \
   TARGET_GOOS=${TARGET_GOOS} \
   TARGET_GOARCH=${TARGET_GOARCH} \
   # the CONTAINER_BUILD envvar is used set github.com/cloudflare/cloudflared/metrics.Runtime=virtual
@@ -13,14 +17,17 @@ ENV GO111MODULE=on \
 
 WORKDIR /go/src/github.com/cloudflare/cloudflared/
 
-# copy our sources into the builder image
+# Download dependencies in their own layer so source-only changes reuse it.
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY . .
 
 # compile cloudflared
 RUN make cloudflared
 
 # use a distroless base image with glibc
-FROM gcr.io/distroless/base-debian13:nonroot
+FROM gcr.io/distroless/base-debian13:nonroot@sha256:f9518b74815721f537a7458cc693b4406208c04fce23bbffab511516117f34fd
 
 LABEL org.opencontainers.image.source="https://github.com/cloudflare/cloudflared"
 
@@ -33,6 +40,10 @@ COPY --from=builder --chown=nonroot /go/src/github.com/cloudflare/cloudflared/cl
 # The `nonroot` user maps to `65532`, from: https://github.com/GoogleContainerTools/distroless/blob/main/common/variables.bzl#L18
 USER 65532:65532
 
+# disable autoupdate: images are updated by pulling a new tag, not by replacing the binary in place.
+# set as an env var rather than an entrypoint flag, so it still applies when the entrypoint is overridden.
+ENV NO_AUTOUPDATE=true
+
 # command / entrypoint of container
-ENTRYPOINT ["cloudflared", "--no-autoupdate"]
+ENTRYPOINT ["cloudflared"]
 CMD ["version"]

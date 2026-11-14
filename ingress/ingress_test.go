@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -555,7 +556,7 @@ func TestSingleOriginServices(t *testing.T) {
 		flagSet.String("unix-socket", "", "")
 		cliCtx := cli.NewContext(cli.NewApp(), flagSet, nil)
 		for i := 0; i < len(params); i += 2 {
-			cliCtx.Set(params[i], params[i+1])
+			_ = cliCtx.Set(params[i], params[i+1])
 		}
 
 		return cliCtx
@@ -605,7 +606,7 @@ func TestSingleOriginServices(t *testing.T) {
 			if test.err != nil {
 				return
 			}
-			require.Equal(t, 1, len(ingress.Rules))
+			require.Len(t, ingress.Rules, 1)
 			rule := ingress.Rules[0]
 			require.Equal(t, test.expectedService, rule.Service)
 		})
@@ -626,7 +627,7 @@ func TestSingleOriginServices_URL(t *testing.T) {
 		flagSet := flag.NewFlagSet(t.Name(), flag.PanicOnError)
 		flagSet.String("url", "", "")
 		cliCtx := cli.NewContext(cli.NewApp(), flagSet, nil)
-		cliCtx.Set(param, value)
+		_ = cliCtx.Set(param, value)
 		return cliCtx
 	}
 
@@ -636,7 +637,7 @@ func TestSingleOriginServices_URL(t *testing.T) {
 			url := urlMustParse(test + host)
 			ingress, err := parseCLIIngress(newCli("url", url.String()), false)
 			require.NoError(t, err)
-			require.Equal(t, 1, len(ingress.Rules))
+			require.Len(t, ingress.Rules, 1)
 			rule := ingress.Rules[0]
 			require.Equal(t, &httpService{url: url}, rule.Service)
 		})
@@ -648,7 +649,7 @@ func TestSingleOriginServices_URL(t *testing.T) {
 			url := urlMustParse(test + host)
 			ingress, err := parseCLIIngress(newCli("url", url.String()), false)
 			require.NoError(t, err)
-			require.Equal(t, 1, len(ingress.Rules))
+			require.Len(t, ingress.Rules, 1)
 			rule := ingress.Rules[0]
 			require.Equal(t, newTCPOverWSService(url), rule.Service)
 		})
@@ -711,8 +712,8 @@ func TestFindMatchingRule(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		_, ruleIndex := ingress.FindMatchingRule(test.host, test.path)
-		assert.Equal(t, test.wantRuleIndex, ruleIndex, fmt.Sprintf("Expect host=%s, path=%s to match rule %d, got %d", test.host, test.path, test.wantRuleIndex, ruleIndex))
+		_, ruleIndex := ingress.FindMatchingRule(test.host, &url.URL{Path: test.path})
+		assert.Equal(t, test.wantRuleIndex, ruleIndex, "Expect host=%s, path=%s to match rule %d, got %d", test.host, test.path, test.wantRuleIndex, ruleIndex)
 	}
 }
 
@@ -785,10 +786,11 @@ ingress:
 		b.Error(err)
 	}
 
+	requestURL := &url.URL{}
 	for n := 0; n < b.N; n++ {
-		ing.FindMatchingRule("tunnel1.example.com", "")
-		ing.FindMatchingRule("tunnel2.example.com", "")
-		ing.FindMatchingRule("tunnel3.example.com", "")
+		ing.FindMatchingRule("tunnel1.example.com", requestURL)
+		ing.FindMatchingRule("tunnel2.example.com", requestURL)
+		ing.FindMatchingRule("tunnel3.example.com", requestURL)
 	}
 }
 
@@ -839,4 +841,478 @@ func MustReadIngress(s string) *config.Configuration {
 		panic(err)
 	}
 	return &conf
+}
+
+func TestCanonicalPathForMatching(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		// Dot-segment traversal — the security-relevant cases.
+		{name: "literal dot-dot", input: "/public/../admin", want: "/admin"},
+		{name: "single dot collapsed", input: "/public/./admin", want: "/public/admin"},
+		{name: "multiple dot-dot segments", input: "/a/b/c/../../..", want: "/"},
+		{name: "deep traversal", input: "/a/b/c/../../../etc/passwd", want: "/etc/passwd"},
+		{name: "double slash collapsed", input: "//etc/passwd", want: "/etc/passwd"},
+		{name: "backslashes normalized", input: `\etc\passwd`, want: "/etc/passwd"},
+		{name: "repeated backslashes collapsed", input: `\\etc\\passwd`, want: "/etc/passwd"},
+		{name: "mixed separators collapsed", input: `/\etc//passwd`, want: "/etc/passwd"},
+		{name: "mixed dot and dot-dot", input: "/a/./b/../c", want: "/a/c"},
+
+		// Trailing slash preservation (including RFC 3986 §5.2.4 implied slash).
+		{name: "trailing slash preserved", input: "/contact/", want: "/contact/"},
+		{name: "trailing dot implies slash", input: "/admin/.", want: "/admin/"},
+		{name: "trailing dot-dot implies slash", input: "/admin/..", want: "/"},
+		{name: "trailing dot with slash", input: "/admin/./", want: "/admin/"},
+		{name: "trailing dot-dot with slash", input: "/admin/../", want: "/"},
+
+		// Normal paths — must be unchanged.
+		{name: "simple path", input: "/api/v1/users", want: "/api/v1/users"},
+		{name: "root", input: "/", want: "/"},
+		{name: "empty becomes root", input: "", want: "/"},
+		{name: "parentheses in segment", input: "/app/(auth)/page.js", want: "/app/(auth)/page.js"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, canonicalPathForMatching(tt.input))
+		})
+	}
+}
+
+func TestCanonicalPathForMatchingEncodedSeparators(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "backslash", input: `\`},
+		{name: "encoded backslash", input: "%5C"},
+		{name: "two encoded backslashes", input: "%5C%5C"},
+		{name: "encoded slash", input: "%2f"},
+		{name: "two encoded slashes", input: "%2f%2f"},
+		{name: "encoded and literal slashes", input: "%2f/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, "/", canonicalPathForMatching(tt.input))
+		})
+	}
+}
+
+func TestCanonicalPathForMatchingMatrixParameters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		path string
+		want string
+	}{
+		{path: "/public/..;/admin", want: "/admin"},
+		{path: "/public/.;x/../admin", want: "/admin"},
+		{path: "/public/;x/../admin", want: "/admin"},
+		{path: "/public/..;x/admin/.;x", want: "/admin/"},
+		{path: "/public/..;x/admin/sub/..;x", want: "/admin/"},
+		{path: "/public/..;x/admin/;x", want: "/admin/"},
+		{path: `/public\..;x\admin`, want: "/"},
+		{path: "/public/..;x/admin;version=1;session=2", want: "/admin"},
+		{path: "/public/..;x//admin/", want: "/admin/"},
+		{path: "/admin;version=1", want: "/admin"},
+		{path: "/admin;x=%2f..%2fpublic", want: "/admin"},
+		{path: "/admin;x=%2F..%2Fpublic", want: "/admin"},
+		{path: "/admin;x=%5C..%5Cpublic", want: "/admin"},
+		{path: "/admin%3Bx=value", want: "/admin;x=value"},
+		{path: "/admin%3bx=value", want: "/admin;x=value"},
+		{path: "/admin%253Bx=value", want: "/admin%3Bx=value"},
+		{path: "/admin%252f..%252fpublic", want: "/admin%2f..%2fpublic"},
+		{path: "/public;version=1/docs", want: "/public/docs"},
+		{path: "/admin", want: "/admin"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, canonicalPathForMatching(tt.path))
+		})
+	}
+}
+
+// TestFindMatchingRuleTraversal verifies that path traversal cannot be used to
+// bypass an ingress rule's Access middleware by sending a request whose raw
+// path does not match the protected rule but whose canonical path resolves to
+// a protected resource.
+//
+// The non-Access /public rule deliberately precedes the Access-protected
+// /admin rule to verify that raw-path matching cannot short-circuit selection.
+func TestFindMatchingRuleTraversal(t *testing.T) {
+	t.Parallel()
+
+	const rulesYAML = `
+ingress:
+ - hostname: app.example.com
+   path: "^/public"
+   service: https://localhost:8080
+ - hostname: app.example.com
+   path: "^/admin"
+   service: https://localhost:8081
+   originRequest:
+     access:
+       required: true
+       teamName: team
+ - hostname: app.example.com
+   service: https://localhost:8082
+ - service: http_status:404
+`
+	ing, err := ParseIngress(MustReadIngress(rulesYAML))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name        string
+		rawURL      string
+		wantRuleNum int // 0 = /public, 1 = /admin with Access, 2 = catch-all
+	}{
+		// Public requests must match the unprotected catch-all.
+		{
+			name:        "normal public path",
+			rawURL:      "https://app.example.com/public/index.html",
+			wantRuleNum: 0,
+		},
+		{
+			name:        "single dot inside public stays in public",
+			rawURL:      "https://app.example.com/public/./index.html",
+			wantRuleNum: 0,
+		},
+		{
+			name:        "normal admin path",
+			rawURL:      "https://app.example.com/admin/index.html",
+			wantRuleNum: 1,
+		},
+
+		// Traversal via literal dot-dot must match the protected rule.
+		{
+			name:        "literal dot-dot enters admin",
+			rawURL:      "https://app.example.com/public/../admin",
+			wantRuleNum: 1,
+		},
+		{
+			name:        "deep traversal enters admin",
+			rawURL:      "https://app.example.com/public/subdir/../../admin",
+			wantRuleNum: 1,
+		},
+
+		// Traversal via percent-encoded dot-segments.
+		// Decode after stripping parameters, then resolve identically to literal dot-dot.
+		{
+			name:        "%2e%2e encoded dot-dot enters admin",
+			rawURL:      "https://app.example.com/public/%2e%2e/admin",
+			wantRuleNum: 1,
+		},
+		{
+			name:        "%2E%2E uppercase encoded dot-dot enters admin",
+			rawURL:      "https://app.example.com/public/%2E%2E/admin",
+			wantRuleNum: 1,
+		},
+		{
+			// ..%2f encodes the slash; net/url decodes it to "../" in URL.Path.
+			name:        "..%2f encoded slash enters admin",
+			rawURL:      "https://app.example.com/public/..%2fadmin",
+			wantRuleNum: 1,
+		},
+		{
+			// .%2e is another way to encode ".."; net/url decodes it to ".." in URL.Path.
+			name:        ".%2e mixed encoding enters admin",
+			rawURL:      "https://app.example.com/public/.%2e/admin",
+			wantRuleNum: 1,
+		},
+		{
+			name:        "encoded backslashes enter admin",
+			rawURL:      "https://app.example.com/public%5C..%5Cadmin",
+			wantRuleNum: 1,
+		},
+		{
+			name:        "repeated encoded and mixed separators enter admin",
+			rawURL:      "https://app.example.com/public%5C%5C..%2fadmin",
+			wantRuleNum: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			u, err := url.Parse(tt.rawURL)
+			require.NoError(t, err)
+			_, ruleNum := ing.FindMatchingRule(u.Host, u)
+			assert.Equal(t, tt.wantRuleNum, ruleNum)
+		})
+	}
+}
+
+func TestFindMatchingRuleSemicolonPaths(t *testing.T) {
+	t.Parallel()
+
+	const rulesYAML = `
+ingress:
+ - hostname: app.example.com
+   path: "^/public;version=1$"
+   service: http_status:200
+ - hostname: app.example.com
+   path: "^/admin;version=1$"
+   service: http_status:200
+   originRequest:
+     access:
+       required: true
+       teamName: team
+ - service: http_status:404
+`
+	for _, disableNormalization := range []bool{false, true} {
+		name := "normalization enabled"
+		if disableNormalization {
+			name = "normalization disabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ing, err := ParseIngress(MustReadIngress(rulesYAML))
+			require.NoError(t, err)
+			ing.DisablePathNormalization = disableNormalization
+
+			tests := []struct {
+				path     string
+				wantRule int
+			}{
+				{path: "/public;version=1", wantRule: 0},
+				{path: "/public%3Bversion=1", wantRule: 0},
+				{path: "/admin;version=1", wantRule: 1},
+				{path: "/admin%3Bversion=1", wantRule: 1},
+				{path: "/public", wantRule: 2},
+				{path: "/admin", wantRule: 2},
+				{path: "/admin;version=2", wantRule: 2},
+			}
+			for _, tt := range tests {
+				t.Run(tt.path, func(t *testing.T) {
+					t.Parallel()
+					u, err := url.Parse("https://app.example.com" + tt.path)
+					require.NoError(t, err)
+					rule, ruleNum := ing.FindMatchingRule(u.Host, u)
+					wantRule := tt.wantRule
+					if !disableNormalization && !strings.Contains(tt.path, "%3B") {
+						// Only literal semicolons introduce parameters before decoding.
+						wantRule = 2
+					}
+					assert.Equal(t, wantRule, ruleNum)
+					assert.Equal(t, wantRule == 1, rule.Config.Access.Required)
+					if wantRule == 1 {
+						require.Len(t, rule.Handlers, 1)
+						assert.Equal(t, "AccessJWTValidator", rule.Handlers[0].Name())
+					} else {
+						assert.Empty(t, rule.Handlers)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestFindMatchingRuleSemicolonInIdentifier documents a compatibility change:
+// a regex can allow semicolons inside an identifier while requiring a suffix in
+// the same segment. Stripping matrix parameters removes that suffix, causing a
+// previously matching request to fall through to the catch-all.
+func TestFindMatchingRuleSemicolonInIdentifier(t *testing.T) {
+	t.Parallel()
+
+	const rulesYAML = `
+ingress:
+ - hostname: app.example.com
+   path: "^/items/[a-z;]+-[0-9]+/info$"
+   service: http_status:200
+   originRequest:
+     access:
+       required: true
+       teamName: team
+ - service: http_status:404
+`
+	ing, err := ParseIngress(MustReadIngress(rulesYAML))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		path     string
+		wantRule int
+	}{
+		{name: "ordinary identifier", path: "/items/ab-1/info", wantRule: 0},
+		{name: "literal semicolon removes required suffix", path: "/items/a;b-1/info", wantRule: 1},
+		{name: "encoded semicolon preserves required suffix", path: "/items/a%3Bb-1/info", wantRule: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			u, err := url.Parse("https://app.example.com" + tt.path)
+			require.NoError(t, err)
+
+			// Before matrix-parameter stripping, all three requests selected
+			// the protected rule after decoding and path normalization.
+			legacyPath := resolveDotSegments(normalizeSeparators(u.Path))
+			_, legacyIndex := ing.findMatchingRule(u.Host, legacyPath)
+			require.Equal(t, 0, legacyIndex)
+
+			rule, ruleIndex := ing.FindMatchingRule(u.Host, u)
+			assert.Equal(t, tt.wantRule, ruleIndex)
+			assert.Equal(t, tt.wantRule == 0, rule.Config.Access.Required)
+			if tt.wantRule == 0 {
+				require.Len(t, rule.Handlers, 1)
+				assert.Equal(t, "AccessJWTValidator", rule.Handlers[0].Name())
+			} else {
+				assert.Empty(t, rule.Handlers)
+			}
+			assert.Equal(t, "https://app.example.com"+tt.path, u.String())
+		})
+	}
+}
+
+// TestFindMatchingRuleMatrixParameterTraversal verifies that the VULN-170057
+// matrix-parameter variants enforce Access under either normalization ordering.
+func TestFindMatchingRuleMatrixParameterTraversal(t *testing.T) {
+	t.Parallel()
+
+	const rulesYAML = `
+ingress:
+ - hostname: app.example.com
+   path: "^/public"
+   service: https://localhost:8080
+ - hostname: app.example.com
+   path: "^/admin"
+   service: https://localhost:8080
+   originRequest:
+     access:
+       required: true
+       teamName: team
+ - service: http_status:404
+`
+	ing, err := ParseIngress(MustReadIngress(rulesYAML))
+	require.NoError(t, err)
+	ing.DisablePathNormalization = false
+
+	tests := []struct {
+		path     string
+		wantRule int
+	}{
+		{path: "/public/../admin", wantRule: 1},
+		{path: "/public/..;/admin", wantRule: 1},
+		{path: "/public/.;x/../admin", wantRule: 1},
+		{path: "/public/.;/../admin", wantRule: 1},
+		{path: "/public/.;x/..;/admin", wantRule: 1},
+		{path: "/public/%2E;x/../admin", wantRule: 1},
+		{path: "/public/;x/../admin", wantRule: 1},
+		{path: "/public/%2e%2e;/admin", wantRule: 1},
+		{path: "/public/..%3B/admin", wantRule: 1},
+		{path: "/public%5C..;x%5Cadmin", wantRule: 1},
+		{path: "/public/..;x/admin/.;x", wantRule: 1},
+		{path: "/public/..;x/admin/sub/..;x", wantRule: 1},
+		{path: "/public/..;x/admin;version=1;session=2", wantRule: 1},
+		{path: "/admin;x=%2f..%2fpublic", wantRule: 1},
+		{path: "/admin;x=%5C..%5Cpublic", wantRule: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			req, err := http.NewRequest(http.MethodGet, "https://app.example.com"+tt.path, nil)
+			require.NoError(t, err)
+			rule, ruleNum := ing.FindMatchingRule(req.Host, req.URL)
+			assert.Equal(t, tt.wantRule, ruleNum)
+			assert.Equal(t, tt.wantRule == 1, rule.Config.Access.Required)
+			if tt.wantRule == 1 {
+				require.Len(t, rule.Handlers, 1)
+				result, err := rule.Handlers[0].Handle(req.Context(), req)
+				require.NoError(t, err)
+				assert.True(t, result.ShouldFilterRequest)
+				assert.Equal(t, http.StatusForbidden, result.StatusCode)
+			} else {
+				assert.Empty(t, rule.Handlers)
+			}
+			assert.Equal(t, "https://app.example.com"+tt.path, req.URL.String())
+		})
+	}
+}
+
+func TestFindMatchingRuleNormalizationGuard(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                 string
+		requireAccess        bool
+		disableNormalization bool
+		wantRule             int
+	}{
+		{name: "enabled", requireAccess: true, wantRule: 1},
+		{name: "disabled", requireAccess: true, disableNormalization: true, wantRule: 2},
+		{name: "no Access rules", wantRule: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ing := Ingress{
+				Rules: []Rule{
+					{Path: MustParsePath(t, "^/public")},
+					{
+						Path:   MustParsePath(t, "^/admin$"),
+						Config: OriginRequestConfig{Access: config.AccessConfig{Required: tt.requireAccess}},
+					},
+					{},
+				},
+				DisablePathNormalization: tt.disableNormalization,
+			}
+			for _, path := range []string{"/admin;x=%2f..%2fpublic", "/%61dmin;x=%2f..%2fpublic"} {
+				u, err := url.Parse("https://app.example.com" + path)
+				require.NoError(t, err)
+				_, ruleNum := ing.FindMatchingRule(u.Host, u)
+				assert.Equal(t, tt.wantRule, ruleNum, path)
+				assert.Equal(t, "https://app.example.com"+path, u.String())
+			}
+			u, err := url.Parse("https://app.example.com/%61dmin")
+			require.NoError(t, err)
+			_, ruleNum := ing.FindMatchingRule(u.Host, u)
+			assert.Equal(t, 1, ruleNum, "matching must still decode paths when normalization is disabled")
+		})
+	}
+}
+
+func TestFindMatchingRuleDoesNotCanonicalizeWithoutAccess(t *testing.T) {
+	t.Parallel()
+
+	ing := Ingress{Rules: []Rule{
+		{Hostname: "app.example.com", Path: MustParsePath(t, "^/public")},
+		{Hostname: "app.example.com", Path: MustParsePath(t, "^/admin")},
+		{},
+	}}
+
+	for _, path := range []string{"/public/../admin", "/public/..;/admin", "/public/.;x/../admin"} {
+		_, ruleNum := ing.FindMatchingRule("app.example.com", &url.URL{Path: path})
+		assert.Equal(t, 0, ruleNum, path)
+	}
+}
+
+func TestFindMatchingRulePathNormalizationCanBeDisabled(t *testing.T) {
+	t.Parallel()
+
+	ing := Ingress{
+		Rules: []Rule{
+			{Hostname: "app.example.com", Path: MustParsePath(t, "^/public")},
+			{
+				Hostname: "app.example.com",
+				Path:     MustParsePath(t, "^/admin"),
+				Config:   OriginRequestConfig{Access: config.AccessConfig{Required: true}},
+			},
+			{},
+		},
+		DisablePathNormalization: true,
+	}
+
+	for _, path := range []string{"/public/../admin", "/public/..;/admin", "/public/.;x/../admin"} {
+		_, ruleNum := ing.FindMatchingRule("app.example.com", &url.URL{Path: path})
+		assert.Equal(t, 0, ruleNum, path)
+	}
 }

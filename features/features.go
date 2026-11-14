@@ -3,29 +3,28 @@ package features
 import "slices"
 
 const (
-	FeatureSerializedHeaders = "serialized_headers"
-	FeatureQuickReconnects   = "quick_reconnects"
-	FeatureAllowRemoteConfig = "allow_remote_config"
-	FeatureDatagramV2        = "support_datagram_v2"
-	FeaturePostQuantum       = "postquantum"
-	FeatureQUICSupportEOF    = "support_quic_eof"
-	FeatureManagementLogs    = "management_logs"
-	FeatureDatagramV3_2      = "support_datagram_v3_2"
+	FeatureDatagramV2   = "support_datagram_v2"
+	FeaturePostQuantum  = "postquantum"
+	FeatureDatagramV3_2 = "support_datagram_v3_2"
+
+	// Legacy features that the edge universally supports and no longer requires to be advertised (TUN-10904).
+	DeprecatedFeatureSerializedHeaders = "serialized_headers"  // Deprecated: TUN-10904
+	DeprecatedFeatureQuickReconnects   = "quick_reconnects"    // Deprecated: TUN-10904
+	DeprecatedFeatureAllowRemoteConfig = "allow_remote_config" // Deprecated: TUN-10904
+	DeprecatedFeatureQUICSupportEOF    = "support_quic_eof"    // Deprecated: TUN-10904
+	DeprecatedFeatureManagementLogs    = "management_logs"     // Deprecated: TUN-10904
 
 	DeprecatedFeatureDatagramV3   = "support_datagram_v3"   // Deprecated: TUN-9291
 	DeprecatedFeatureDatagramV3_1 = "support_datagram_v3_1" // Deprecated: TUN-9883
 )
 
-var defaultFeatures = []string{
-	FeatureAllowRemoteConfig,
-	FeatureSerializedHeaders,
-	FeatureDatagramV2,
-	FeatureQUICSupportEOF,
-	FeatureManagementLogs,
-}
-
 // List of features that are no longer in-use.
 var deprecatedFeatures = []string{
+	DeprecatedFeatureSerializedHeaders,
+	DeprecatedFeatureQuickReconnects,
+	DeprecatedFeatureAllowRemoteConfig,
+	DeprecatedFeatureQUICSupportEOF,
+	DeprecatedFeatureManagementLogs,
 	DeprecatedFeatureDatagramV3,
 	DeprecatedFeatureDatagramV3_1,
 }
@@ -42,6 +41,10 @@ type FeatureSnapshot struct {
 	// We provide the list of features since we need it to send in the ConnectionOptions during connection
 	// registrations.
 	FeaturesList []string
+
+	// SkipPrechecks indicates when to skip connectivity pre-checks at startup.
+	// Controlled via DNS TXT record to allow remote kill-switch in case of issues.
+	SkipPrechecks bool
 }
 
 type PostQuantumMode uint8

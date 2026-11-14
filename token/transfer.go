@@ -20,14 +20,23 @@ const (
 	clientTimeout = time.Second * 60
 )
 
+// Test seams; production code always uses OpenBrowser and the default HTTP transport.
+var (
+	openBrowser       = OpenBrowser
+	transferTransport http.RoundTripper
+)
+
 // RunTransfer does the transfer "dance" with the end result downloading the supported resource.
 // The expanded description is run is encapsulation of shared business logic needed
 // to request a resource (token/cert/etc) from the transfer service (loginhelper).
 // The "dance" we refer to is building a HTTP request, opening that in a browser waiting for
 // the user to complete an action, while it long polls in the background waiting for an
 // action to be completed to download the resource.
-func RunTransfer(transferURL *url.URL, appAUD, resourceName, key, value string, shouldEncrypt bool, useHostOnly bool, autoClose bool, fedramp bool, log *zerolog.Logger) ([]byte, error) {
-	encrypterClient, err := NewEncrypter("cloudflared_priv.pem", "cloudflared_pub.pem")
+//
+// If urlFilePath is non-empty, the generated auth URL is written to that path so
+// other waiting processes can display it to the user. Pass "" to skip.
+func RunTransfer(transferURL *url.URL, appAUD, resourceName, key, value string, shouldEncrypt bool, useHostOnly bool, autoClose bool, fedramp bool, log *zerolog.Logger, urlFilePath string) ([]byte, error) {
+	encrypterClient, err := NewEncrypter()
 	if err != nil {
 		return nil, err
 	}
@@ -36,8 +45,13 @@ func RunTransfer(transferURL *url.URL, appAUD, resourceName, key, value string, 
 		return nil, err
 	}
 
+	// write auth URL to companion file so other waiting processes can display it
+	if urlFilePath != "" {
+		_ = os.WriteFile(urlFilePath, []byte(requestURL), 0600) // nolint: gosec
+	}
+
 	// See AUTH-1423 for why we use stderr (the way git wraps ssh)
-	err = OpenBrowser(requestURL)
+	err = openBrowser(requestURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Please open the following URL and log in with your Cloudflare account:\n\n%s\n\nLeave cloudflared running to download the %s automatically.\n", requestURL, resourceName)
 	} else {
@@ -108,7 +122,7 @@ func buildRequestURL(baseURL *url.URL, appAUD string, key, value string, cli, us
 
 // transferRequest downloads the requested resource from the request URL
 func transferRequest(requestURL string, log *zerolog.Logger) ([]byte, string, error) {
-	client := &http.Client{Timeout: clientTimeout}
+	client := &http.Client{Timeout: clientTimeout, Transport: transferTransport}
 	const pollAttempts = 10
 	// we do "long polling" on the endpoint to get the resource.
 	for i := 0; i < pollAttempts; i++ {
@@ -128,12 +142,12 @@ func poll(client *http.Client, requestURL string, log *zerolog.Logger) ([]byte, 
 	if err != nil {
 		return nil, "", err
 	}
-	req.Header.Set("User-Agent", userAgent)
-	resp, err := client.Do(req)
+	req.Header.Set(userAgentHeader, userAgent)
+	resp, err := client.Do(req) // nolint: gosec
 	if err != nil {
 		return nil, "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// ignore everything other than server errors as the resource
 	// may not exist until the user does the interaction

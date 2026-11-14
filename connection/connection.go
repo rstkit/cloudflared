@@ -24,7 +24,8 @@ const (
 	lbProbeUserAgentPrefix = "Mozilla/5.0 (compatible; Cloudflare-Traffic-Manager/1.0; +https://www.cloudflare.com/traffic-manager/;"
 	LogFieldConnIndex      = "connIndex"
 	MaxGracePeriod         = time.Minute * 3
-	MaxConcurrentStreams   = math.MaxUint32
+	// Go 1.27 defaults limits above MaxInt32 to 250 concurrent streams.
+	MaxConcurrentStreams = math.MaxInt32
 
 	contentTypeHeader      = "content-type"
 	contentLengthHeader    = "content-length"
@@ -56,8 +57,9 @@ type Orchestrator interface {
 }
 
 type TunnelProperties struct {
-	Credentials    Credentials
-	QuickTunnelUrl string
+	Credentials           Credentials
+	QuickTunnelUrl        string
+	QuickTunnelAuthorizer HTTPRequestAuthorizer
 }
 
 // Credentials are stored in the credentials file and contain all info needed to run a tunnel.
@@ -84,7 +86,7 @@ type TunnelToken struct {
 }
 
 func (t TunnelToken) Credentials() Credentials {
-	// nolint: gosimple
+	// nolint: staticcheck
 	return Credentials{
 		AccountTag:   t.AccountTag,
 		TunnelSecret: t.TunnelSecret,
@@ -122,6 +124,7 @@ const (
 
 // ShouldFlush returns whether this kind of connection should actively flush data
 func (t Type) shouldFlush() bool {
+	// nolint: exhaustive
 	switch t {
 	case TypeWebsocket, TypeTCP, TypeControlStream:
 		return true
@@ -131,6 +134,7 @@ func (t Type) shouldFlush() bool {
 }
 
 func (t Type) String() string {
+	// nolint: exhaustive
 	switch t {
 	case TypeWebsocket:
 		return "websocket"
@@ -143,6 +147,23 @@ func (t Type) String() string {
 	default:
 		return fmt.Sprintf("Unknown Type %d", t)
 	}
+}
+
+// HTTPRequestAuthorizationDecision determines whether an authorized HTTP
+// request may continue to ingress selection. The zero value fails closed.
+type HTTPRequestAuthorizationDecision uint8
+
+const (
+	// HTTPRequestAuthorizationHandled stops processing because the authorizer owns the response.
+	HTTPRequestAuthorizationHandled HTTPRequestAuthorizationDecision = iota
+	// HTTPRequestAuthorizationAllowed permits the request to continue to ingress selection.
+	HTTPRequestAuthorizationAllowed
+)
+
+// HTTPRequestAuthorizer authorizes an HTTP request before ingress selection.
+// A handled decision or error means the authorizer owns the response.
+type HTTPRequestAuthorizer interface {
+	AuthorizeHTTP(w http.ResponseWriter, r *http.Request) (decision HTTPRequestAuthorizationDecision, outcome string, err error)
 }
 
 // OriginProxy is how data flows from cloudflared to the origin services running behind it.
